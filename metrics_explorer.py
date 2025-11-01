@@ -1,9 +1,9 @@
 # metrics_explorer.py
 # CSV explorer with multi-select Project/Run, metric sorting, Unnamed-column removal,
-# HARD-CODED metric-name → short-label mapping, and per-column single-hue heatmap.
+# HARD-CODED metric-name → short-label mapping, and baseline vs. comparison diff highlighting.
 # - Fixes Streamlit deprecation: use width='stretch' instead of use_container_width.
 # - None/NaN show as empty text and get a white background.
-# - Heatmap: single color (default 'Blues'), small→white, big→dense.
+# - Diff column: green when > 0, red otherwise.
 
 import re
 from typing import Dict, List
@@ -41,9 +41,6 @@ METRIC_NAME_MAP: Dict[str, str] = {
 # Optional: auto-shorten any unmapped metric names so more fit on screen
 AUTO_SHORTEN_UNMAPPED = True
 AUTO_MAX_LEN = 14  # characters (adjust in the sidebar UI)
-
-# Single-hue colormap for all metric columns (choices: 'Blues','Reds','Greens','Purples','Oranges','Greys')
-SINGLE_HUE_CMAP = "Blues"
 
 # Which columns are identifiers (we don't shorten these unless you map them)
 IDENTIFIER_HINTS = {"project", "project_id", "proj", "workspace", "team",
@@ -137,31 +134,58 @@ numeric_candidates = [
 # ───────────────────────────────────────────────────────────────────────────────
 # Sidebar controls
 # ───────────────────────────────────────────────────────────────────────────────
-st.sidebar.header("2) Map columns")
-project_col = st.sidebar.selectbox(
-    "Project column", options=all_cols, index=(all_cols.index(project_guess) if project_guess else 0)
-)
-run_col = st.sidebar.selectbox(
-    "Run column", options=all_cols, index=(all_cols.index(run_guess) if run_guess else (1 if len(all_cols) > 1 else 0))
-)
+project_col = project_guess or ("project" if "project" in all_cols else None)
+run_col = run_guess or ("run_name" if "run_name" in all_cols else None)
+
+if project_col is None:
+    st.error("Could not detect the project column. Ensure your CSV includes a 'project' column.")
+    st.stop()
+
+if run_col is None:
+    st.error("Could not detect the run column. Ensure your CSV includes a 'run_name' column.")
+    st.stop()
+
+st.sidebar.header("2) Metrics")
 
 metric_options = numeric_candidates if numeric_candidates else all_cols
 metric_col = st.sidebar.selectbox("Metric (for sorting)", options=metric_options, index=0)
 order = st.sidebar.selectbox("Order", options=["Descending", "Ascending"], index=0)
 
 st.sidebar.header("3) Filters")
-def choices_for(col):
-    vals = df[col].dropna().astype(str).unique().tolist()
+
+def choices_for(source_df: pd.DataFrame, col: str) -> List[str]:
+    vals = source_df[col].dropna().astype(str).unique().tolist()
     vals.sort()
     return vals
 
-projects_selected = st.sidebar.multiselect("Projects (empty = all)", options=choices_for(project_col))
-runs_selected = st.sidebar.multiselect("Runs (empty = all)", options=choices_for(run_col))
+projects_selected = st.sidebar.multiselect("Projects (empty = all)", options=choices_for(df, project_col))
+
+project_filtered_df = df
+if projects_selected:
+    project_filtered_df = project_filtered_df[project_filtered_df[project_col].astype(str).isin(projects_selected)]
+
+run_choices = choices_for(project_filtered_df, run_col)
+if not run_choices:
+    st.sidebar.warning("No runs available for the selected project filters.")
+    st.stop()
+
+baseline_run = st.sidebar.selectbox("Baseline run", options=run_choices, index=0)
+
+comparison_options = [r for r in run_choices if r != baseline_run]
+comparison_default = comparison_options[:1] if comparison_options else []
+comparison_runs = st.sidebar.multiselect(
+    "Comparison runs",
+    options=comparison_options,
+    default=comparison_default,
+)
+
+baseline_run = str(baseline_run)
+comparison_runs = [str(r) for r in comparison_runs]
+
 search_term = st.sidebar.text_input("Search (filters all columns)", value="")
 
 st.sidebar.header("4) Display")
 AUTO_MAX_LEN = st.sidebar.slider("Auto-shorten length (for unmapped)", 6, 40, AUTO_MAX_LEN)
-SINGLE_HUE_CMAP = st.sidebar.selectbox("Heatmap color", ["Blues", "Reds", "Greens", "Purples", "Oranges", "Greys"], index=0)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Build short labels
@@ -194,8 +218,9 @@ work = df.copy()
 if projects_selected:
     work = work[work[project_col].astype(str).isin(projects_selected)]
 
-if runs_selected:
-    work = work[work[run_col].astype(str).isin(runs_selected)]
+selected_runs = [baseline_run] + comparison_runs if baseline_run else comparison_runs
+if selected_runs:
+    work = work[work[run_col].astype(str).isin(selected_runs)]
 
 if search_term.strip():
     q = search_term.lower().strip()
@@ -216,16 +241,70 @@ else:
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Prepare display DataFrame with short headers
+# Prepare transposed display DataFrame
 # ───────────────────────────────────────────────────────────────────────────────
-display_df = work.rename(columns=label_map)
+if work.empty:
+    st.warning("No rows match the current filters/search.")
+    st.stop()
 
-# Identify numeric columns that actually have ≥1 non-NaN after filtering
-numeric_display_cols = []
-for orig in work.columns:
-    if pd.api.types.is_numeric_dtype(work[orig]):
-        if pd.to_numeric(work[orig], errors="coerce").notna().any():
-            numeric_display_cols.append(label_map[orig])
+metric_cols = [col for col in work.columns if col not in {project_col, run_col}]
+if not metric_cols:
+    st.warning("No metric columns available to display.")
+    st.stop()
+
+comparison_runs_sorted = comparison_runs
+if comparison_runs:
+    sorted_run_order = (
+        work.sort_values(metric_col, ascending=ascending, kind="mergesort")[run_col]
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+    comparison_runs_sorted = [r for r in sorted_run_order if r in comparison_runs]
+    if len(comparison_runs_sorted) < len(comparison_runs):
+        remaining = [r for r in comparison_runs if r not in comparison_runs_sorted]
+        comparison_runs_sorted.extend(remaining)
+
+runs_display_order = [baseline_run] + comparison_runs_sorted
+work_runs = work[run_col].astype(str)
+runs_in_work = set(work_runs)
+missing_runs = [r for r in runs_display_order if r not in runs_in_work]
+
+if missing_runs:
+    st.warning(
+        "The following selected runs are not present after filtering/search: "
+        + ", ".join(missing_runs)
+    )
+
+rows = []
+for metric in metric_cols:
+    metric_label = label_map[metric]
+    row_values = {"Metric": metric_label}
+    for run in runs_display_order:
+        mask = work_runs == run
+        series = work.loc[mask, metric]
+        if not series.empty:
+            value = pd.to_numeric(series, errors="coerce").iloc[0]
+        else:
+            value = np.nan
+        row_values[run] = value
+    rows.append(row_values)
+
+display_df = pd.DataFrame(rows)
+
+diff_column_name = None
+if comparison_runs_sorted and len(comparison_runs_sorted) == 1:
+    comp_run = comparison_runs_sorted[0]
+    diff_column_name = "Diff"
+    display_df[diff_column_name] = display_df[comp_run] - display_df[baseline_run]
+
+value_columns = [col for col in runs_display_order if col in display_df.columns]
+if diff_column_name:
+    value_columns.append(diff_column_name)
+
+display_df = display_df[["Metric"] + value_columns]
+
+numeric_display_cols = [col for col in value_columns if pd.api.types.is_numeric_dtype(display_df[col])]
 
 # ───────────────────────────────────────────────────────────────────────────────
 # UI
@@ -236,16 +315,21 @@ with left:
 with right:
     st.metric("Rows", value=len(display_df))
 
+comparison_text = (
+    f"Comparisons: **{', '.join(comparison_runs)}**."
+    if comparison_runs
+    else "Comparisons: **None**."
+)
 st.caption(
     f"Sorted by **{metric_col}** ({'ascending' if ascending else 'descending'}). "
     f"Projects: **{', '.join(projects_selected) if projects_selected else 'All'}**, "
-    f"Runs: **{', '.join(runs_selected) if runs_selected else 'All'}**."
+    f"Baseline: **{baseline_run}**, {comparison_text}"
 )
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Styling:
 # - Format all numeric cells to 5 decimals.
-# - Use single-hue background gradient per numeric column (small→white, big→dense).
+# - Highlight diff column green (>0) or red (<=0).
 # - Show None/NaN as empty text and force white background on those cells.
 # - Auto-size column min-width so content fits; prevent wrapping.
 # ───────────────────────────────────────────────────────────────────────────────
@@ -259,15 +343,14 @@ if numeric_display_cols:
     five_dec_formatter = {col: (lambda v: "" if pd.isna(v) else f"{float(v):.5f}") for col in numeric_display_cols}
     styler = styler.format(formatter=five_dec_formatter, na_rep="")
 
-# Apply single-hue heatmap per numeric column (min→max, near-white to dense)
-if numeric_display_cols:
-    styler = styler.background_gradient(
-        cmap=SINGLE_HUE_CMAP,  # e.g., 'Blues': white→blue
-        subset=numeric_display_cols,
-        axis=0
-    )
+if diff_column_name:
+    def color_diff(val):
+        if pd.isna(val) or val == "":
+            return ""
+        return "color: green" if val > 0 else "color: red"
+    styler = styler.applymap(color_diff, subset=[diff_column_name])
 
-# White background for None/NaN in all columns — APPLY THIS LAST so it overrides the gradient
+# White background for None/NaN in all columns — apply last so it overrides prior styling
 def white_na(s: pd.Series):
     return ['background-color: white' if pd.isna(v) or v == "" else '' for v in s]
 
@@ -277,7 +360,7 @@ styler = styler.apply(white_na, axis=0)
 # Compute the max content width (in characters) per displayed column.
 width_map: Dict[str, int] = {}
 for col_label in display_df.columns:
-    series = work.rename(columns=label_map)[col_label]
+    series = display_df[col_label]
     if col_label in numeric_display_cols:
         # Use the 5-decimal formatted text for sizing
         texts = series.map(lambda v: "" if pd.isna(v) else f"{float(v):.5f}")
