@@ -13,6 +13,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import streamlit as st
+from math import erf, sqrt
 
 st.set_page_config(page_title="Metrics Explorer", layout="wide")
 st.title("📊 Metrics Explorer")
@@ -37,6 +38,78 @@ METRIC_NAME_MAP: Dict[str, str] = {
     "code/lcb/pass@1": "lcb@1",
     "code/lcb/pass@10": "lcb@10",
 }
+
+SAMPLE_SIZE_BY_METRIC: Dict[str, int] = {
+    "metrics/mmlu/0-shot/InContextLearningMultipleChoiceAccuracy": 14079,
+    "metrics/mmlu/5-shot/InContextLearningMultipleChoiceAccuracy": 14079,
+    "mmlu0": 14079,
+    "mmlu5": 14079,
+    "metrics/mmlu-pro/0-shot/InContextLearningMultipleChoiceAccuracy": 12032,
+    "metrics/mmlu-pro/5-shot/InContextLearningMultipleChoiceAccuracy": 12032,
+    "mmlu-pro0": 12032,
+    "mmlu-pro5": 12032,
+    "math/MATH": 500,
+    "MATH": 500,
+    "math/MATH_ru": 500,
+    "MATH_ru": 500,
+    "math/gsm8k": 1319,
+    "gsm8k": 1319,
+    "math/gsm8k_ru": 1319,
+    "gsm8k_ru": 1319,
+    "code/humaneval/base_pass@1": 164,
+    "humaneval_base@1": 164,
+    "code/humaneval/plus_pass@1": 164,
+    "humaneval_plus@1": 164,
+    "code/mbpp/base_pass@1": 427,
+    "mbpp_base@1": 427,
+    "code/mbpp/plus_pass@1": 378,
+    "mbpp_plus@1": 378,
+    "code/lcb/pass@1": 1055,
+    "code/lcb/pass@10": 1055,
+    "lcb@1": 1055,
+    "lcb@10": 1055,
+}
+
+def get_sample_size_for_metric(metric_name: str, metric_label: str) -> float:
+    candidates = [
+        metric_name,
+        metric_label,
+        metric_name.lower(),
+        metric_label.lower(),
+    ]
+    for key in candidates:
+        if key in SAMPLE_SIZE_BY_METRIC:
+            return SAMPLE_SIZE_BY_METRIC[key]
+    return np.nan
+
+def normalize_probability(value) -> float:
+    if pd.isna(value):
+        return np.nan
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    if val < 0:
+        return np.nan
+    if 1.0 < val <= 100.0:
+        val = val / 100.0
+    if val < 0 or val > 1:
+        return np.nan
+    return val
+
+def two_proportion_p_value(p1: float, p2: float, n: float) -> float:
+    if (
+        pd.isna(p1) or pd.isna(p2) or pd.isna(n)
+        or n <= 0
+    ):
+        return np.nan
+    pooled = (p1 + p2) / 2.0
+    variance = pooled * (1.0 - pooled) * (2.0 / n)
+    if variance <= 0:
+        return np.nan
+    z = (p1 - p2) / np.sqrt(variance)
+    cdf = 0.5 * (1 + erf(abs(z) / sqrt(2)))
+    return max(0.0, min(1.0, 2 * (1 - cdf)))
 
 # Optional: auto-shorten any unmapped metric names so more fit on screen
 AUTO_SHORTEN_UNMAPPED = True
@@ -158,7 +231,25 @@ def choices_for(source_df: pd.DataFrame, col: str) -> List[str]:
     vals.sort()
     return vals
 
-projects_selected = st.sidebar.multiselect("Projects (empty = all)", options=choices_for(df, project_col))
+project_options = choices_for(df, project_col)
+PROJECT_MULTI_KEY = "project_multiselect"
+if PROJECT_MULTI_KEY not in st.session_state:
+    st.session_state[PROJECT_MULTI_KEY] = []
+
+st.session_state[PROJECT_MULTI_KEY] = [
+    p for p in st.session_state[PROJECT_MULTI_KEY] if p in project_options
+]
+
+def _select_all_projects():
+    st.session_state[PROJECT_MULTI_KEY] = project_options.copy()
+
+st.sidebar.button("Select all projects", key="select_all_projects_btn", on_click=_select_all_projects)
+
+projects_selected = st.sidebar.multiselect(
+    "Projects (empty = all)",
+    options=project_options,
+    key=PROJECT_MULTI_KEY,
+)
 
 project_filtered_df = df
 if projects_selected:
@@ -173,10 +264,25 @@ baseline_run = st.sidebar.selectbox("Baseline run", options=run_choices, index=0
 
 comparison_options = [r for r in run_choices if r != baseline_run]
 comparison_default = comparison_options[:1] if comparison_options else []
+COMPARISON_MULTI_KEY = "comparison_runs_multiselect"
+if COMPARISON_MULTI_KEY not in st.session_state:
+    st.session_state[COMPARISON_MULTI_KEY] = comparison_default.copy()
+else:
+    st.session_state[COMPARISON_MULTI_KEY] = [
+        r for r in st.session_state[COMPARISON_MULTI_KEY] if r in comparison_options
+    ]
+    if not st.session_state[COMPARISON_MULTI_KEY] and comparison_default:
+        st.session_state[COMPARISON_MULTI_KEY] = comparison_default.copy()
+
+def _select_all_runs():
+    st.session_state[COMPARISON_MULTI_KEY] = comparison_options.copy()
+
+st.sidebar.button("Select all runs", key="select_all_runs_btn", on_click=_select_all_runs)
+
 comparison_runs = st.sidebar.multiselect(
     "Comparison runs",
     options=comparison_options,
-    default=comparison_default,
+    key=COMPARISON_MULTI_KEY,
 )
 
 baseline_run = str(baseline_run)
@@ -279,7 +385,8 @@ if missing_runs:
 rows = []
 for metric in metric_cols:
     metric_label = label_map[metric]
-    row_values = {"Metric": metric_label}
+    sample_size = get_sample_size_for_metric(metric, metric_label)
+    row_values = {"Metric": metric_label, "_sample_size": sample_size}
     for run in runs_display_order:
         mask = work_runs == run
         series = work.loc[mask, metric]
@@ -292,15 +399,44 @@ for metric in metric_cols:
 
 display_df = pd.DataFrame(rows)
 
+run_value_cols = [col for col in runs_display_order if col in display_df.columns]
+if run_value_cols:
+    display_df = display_df[~display_df[run_value_cols].isna().all(axis=1)].reset_index(drop=True)
+
+if display_df.empty:
+    st.warning("No metrics have values for the selected runs.")
+    st.stop()
+
 diff_column_name = None
 if comparison_runs_sorted and len(comparison_runs_sorted) == 1:
     comp_run = comparison_runs_sorted[0]
     diff_column_name = "Diff"
     display_df[diff_column_name] = display_df[comp_run] - display_df[baseline_run]
 
-value_columns = [col for col in runs_display_order if col in display_df.columns]
+p_value_column_name = None
+if diff_column_name:
+    sample_sizes = display_df["_sample_size"] if "_sample_size" in display_df.columns else pd.Series(np.nan, index=display_df.index)
+    baseline_values = display_df[baseline_run]
+    comparison_values = display_df[comp_run]
+    p_values = []
+    for base_val, comp_val, sample_size in zip(baseline_values, comparison_values, sample_sizes):
+        base_prob = normalize_probability(base_val)
+        comp_prob = normalize_probability(comp_val)
+        p_values.append(two_proportion_p_value(base_prob, comp_prob, sample_size))
+    p_value_column_name = "P-value"
+    display_df[p_value_column_name] = p_values
+
+if "_sample_size" in display_df.columns:
+    display_df = display_df.drop(columns=["_sample_size"])
+
+run_columns_in_display = [col for col in runs_display_order if col in display_df.columns]
+selected_run_count = len(run_columns_in_display)
+
+value_columns = run_columns_in_display.copy()
 if diff_column_name:
     value_columns.append(diff_column_name)
+if p_value_column_name:
+    value_columns.append(p_value_column_name)
 
 display_df = display_df[["Metric"] + value_columns]
 
@@ -313,23 +449,12 @@ left, right = st.columns([3, 1])
 with left:
     st.subheader("Results")
 with right:
-    st.metric("Rows", value=len(display_df))
-
-comparison_text = (
-    f"Comparisons: **{', '.join(comparison_runs)}**."
-    if comparison_runs
-    else "Comparisons: **None**."
-)
-st.caption(
-    f"Sorted by **{metric_col}** ({'ascending' if ascending else 'descending'}). "
-    f"Projects: **{', '.join(projects_selected) if projects_selected else 'All'}**, "
-    f"Baseline: **{baseline_run}**, {comparison_text}"
-)
+    st.metric("Selected runs", value=selected_run_count)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Styling:
 # - Format all numeric cells to 5 decimals.
-# - Highlight diff column green (>0) or red (<=0).
+# - Highlight diff column green/red with stronger shades for p-value <0.05 / <0.01.
 # - Show None/NaN as empty text and force white background on those cells.
 # - Auto-size column min-width so content fits; prevent wrapping.
 # ───────────────────────────────────────────────────────────────────────────────
@@ -344,11 +469,41 @@ if numeric_display_cols:
     styler = styler.format(formatter=five_dec_formatter, na_rep="")
 
 if diff_column_name:
-    def color_diff(val):
-        if pd.isna(val) or val == "":
-            return ""
-        return "color: green" if val > 0 else "color: red"
-    styler = styler.applymap(color_diff, subset=[diff_column_name])
+    strong_green = "background-color: #2f855a; color: white"
+    light_green = "background-color: #9ae6b4; color: #1c4532"
+    neutral_green = "background-color: #e6fffa; color: #22543d"
+    strong_red = "background-color: #c53030; color: white"
+    light_red = "background-color: #feb2b2; color: #742a2a"
+    neutral_red = "background-color: #fff5f5; color: #742a2a"
+
+    p_series = display_df[p_value_column_name] if p_value_column_name else pd.Series(np.nan, index=display_df.index)
+
+    def diff_highlight(col: pd.Series) -> List[str]:
+        styles: List[str] = []
+        for idx, diff_val in col.items():
+            p_val = p_series.loc[idx]
+            if pd.isna(diff_val):
+                styles.append("")
+                continue
+            if diff_val > 0:
+                if pd.notna(p_val) and p_val < 0.01:
+                    styles.append(strong_green)
+                elif pd.notna(p_val) and p_val < 0.05:
+                    styles.append(light_green)
+                else:
+                    styles.append(neutral_green)
+            elif diff_val < 0:
+                if pd.notna(p_val) and p_val < 0.01:
+                    styles.append(strong_red)
+                elif pd.notna(p_val) and p_val < 0.05:
+                    styles.append(light_red)
+                else:
+                    styles.append(neutral_red)
+            else:
+                styles.append("")
+        return styles
+
+    styler = styler.apply(diff_highlight, subset=[diff_column_name])
 
 # White background for None/NaN in all columns — apply last so it overrides prior styling
 def white_na(s: pd.Series):
