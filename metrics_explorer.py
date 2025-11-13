@@ -407,25 +407,48 @@ if display_df.empty:
     st.warning("No metrics have values for the selected runs.")
     st.stop()
 
+sample_size_series = (
+    display_df["_sample_size"]
+    if "_sample_size" in display_df.columns
+    else pd.Series(np.nan, index=display_df.index)
+)
+
+baseline_for_calcs = display_df[baseline_run] if baseline_run in display_df.columns else None
+run_diffs: Dict[str, pd.Series] = {}
+run_pvalues: Dict[str, pd.Series] = {}
+
+if baseline_for_calcs is not None:
+    for run in comparison_runs_sorted:
+        if run not in display_df.columns:
+            continue
+        comp_series = display_df[run]
+        diff_series = comp_series - baseline_for_calcs
+        run_diffs[run] = diff_series
+        p_values: List[float] = []
+        for base_val, comp_val, sample_size in zip(baseline_for_calcs, comp_series, sample_size_series):
+            base_prob = normalize_probability(base_val)
+            comp_prob = normalize_probability(comp_val)
+            p_values.append(two_proportion_p_value(base_prob, comp_prob, sample_size))
+        run_pvalues[run] = pd.Series(p_values, index=display_df.index)
+
 diff_column_name = None
 comp_run = None
 if comparison_runs_sorted and len(comparison_runs_sorted) == 1:
     comp_run = comparison_runs_sorted[0]
     diff_column_name = "Diff"
-    display_df[diff_column_name] = display_df[comp_run] - display_df[baseline_run]
+    if comp_run in run_diffs:
+        display_df[diff_column_name] = run_diffs[comp_run]
+    else:
+        display_df[diff_column_name] = display_df[comp_run] - display_df.get(baseline_run, np.nan)
 
 p_value_column_name = None
 if diff_column_name:
-    sample_sizes = display_df["_sample_size"] if "_sample_size" in display_df.columns else pd.Series(np.nan, index=display_df.index)
-    baseline_values = display_df[baseline_run]
-    comparison_values = display_df[comp_run]
-    p_values = []
-    for base_val, comp_val, sample_size in zip(baseline_values, comparison_values, sample_sizes):
-        base_prob = normalize_probability(base_val)
-        comp_prob = normalize_probability(comp_val)
-        p_values.append(two_proportion_p_value(base_prob, comp_prob, sample_size))
     p_value_column_name = "P-value"
-    display_df[p_value_column_name] = p_values
+    p_series = run_pvalues.get(comp_run)
+    if p_series is not None:
+        display_df[p_value_column_name] = p_series.values
+    else:
+        display_df[p_value_column_name] = np.nan
 
 if "_sample_size" in display_df.columns:
     display_df = display_df.drop(columns=["_sample_size"])
@@ -469,10 +492,9 @@ if numeric_display_cols:
     five_dec_formatter = {col: (lambda v: "" if pd.isna(v) else f"{float(v):.5f}") for col in numeric_display_cols}
     styler = styler.format(formatter=five_dec_formatter, na_rep="")
 
-baseline_series = display_df[baseline_run] if baseline_run in display_df.columns else None
 highlight_runs = [run for run in comparison_runs_sorted if run in display_df.columns]
 
-if baseline_series is not None and highlight_runs:
+if baseline_for_calcs is not None and highlight_runs:
     strong_green = "background-color: #2f855a; color: white"
     light_green = "background-color: #9ae6b4; color: #1c4532"
     neutral_green = "background-color: #e6fffa; color: #22543d"
@@ -480,19 +502,18 @@ if baseline_series is not None and highlight_runs:
     light_red = "background-color: #feb2b2; color: #742a2a"
     neutral_red = "background-color: #fff5f5; color: #742a2a"
 
-    def make_value_highlighter(p_series: Optional[pd.Series]):
+    def make_value_highlighter(diff_series: pd.Series, p_series: Optional[pd.Series]):
         def _highlight(col: pd.Series) -> List[str]:
             styles: List[str] = []
             for idx, comp_val in col.items():
-                base_val = baseline_series.loc[idx]
-                if pd.isna(comp_val) or pd.isna(base_val):
+                if pd.isna(comp_val):
                     styles.append("")
                     continue
-                diff_val = comp_val - base_val
-                if diff_val == 0 or pd.isna(diff_val):
+                diff_val = diff_series.loc[idx] if diff_series is not None else np.nan
+                if pd.isna(diff_val) or diff_val == 0:
                     styles.append("")
                     continue
-                p_val = p_series.loc[idx] if p_series is not None else np.nan
+                p_val = p_series.loc[idx] if (p_series is not None and idx in p_series.index) else np.nan
                 if diff_val > 0:
                     if pd.notna(p_val) and p_val < 0.01:
                         styles.append(strong_green)
@@ -511,8 +532,11 @@ if baseline_series is not None and highlight_runs:
         return _highlight
 
     for run in highlight_runs:
-        run_p_series = display_df[p_value_column_name] if (diff_column_name and p_value_column_name and run == comp_run) else None
-        styler = styler.apply(make_value_highlighter(run_p_series), subset=[run])
+        diff_series = run_diffs.get(run)
+        if diff_series is None:
+            continue
+        run_p_series = run_pvalues.get(run)
+        styler = styler.apply(make_value_highlighter(diff_series, run_p_series), subset=[run])
 
 # White background for None/NaN in all columns — apply last so it overrides prior styling
 def white_na(s: pd.Series):
