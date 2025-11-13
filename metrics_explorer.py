@@ -3,10 +3,10 @@
 # HARD-CODED metric-name → short-label mapping, and baseline vs. comparison diff highlighting.
 # - Fixes Streamlit deprecation: use width='stretch' instead of use_container_width.
 # - None/NaN show as empty text and get a white background.
-# - Diff column: green when > 0, red otherwise.
+# - Comparison run values: green when > baseline, red otherwise (p-value-weighted).
 
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathlib import Path
 import argparse
 
@@ -408,6 +408,7 @@ if display_df.empty:
     st.stop()
 
 diff_column_name = None
+comp_run = None
 if comparison_runs_sorted and len(comparison_runs_sorted) == 1:
     comp_run = comparison_runs_sorted[0]
     diff_column_name = "Diff"
@@ -454,7 +455,7 @@ with right:
 # ───────────────────────────────────────────────────────────────────────────────
 # Styling:
 # - Format all numeric cells to 5 decimals.
-# - Highlight diff column green/red with stronger shades for p-value <0.05 / <0.01.
+# - Highlight comparison value columns green/red with stronger shades for p-value <0.05 / <0.01 (when available).
 # - Show None/NaN as empty text and force white background on those cells.
 # - Auto-size column min-width so content fits; prevent wrapping.
 # ───────────────────────────────────────────────────────────────────────────────
@@ -468,7 +469,10 @@ if numeric_display_cols:
     five_dec_formatter = {col: (lambda v: "" if pd.isna(v) else f"{float(v):.5f}") for col in numeric_display_cols}
     styler = styler.format(formatter=five_dec_formatter, na_rep="")
 
-if diff_column_name:
+baseline_series = display_df[baseline_run] if baseline_run in display_df.columns else None
+highlight_runs = [run for run in comparison_runs_sorted if run in display_df.columns]
+
+if baseline_series is not None and highlight_runs:
     strong_green = "background-color: #2f855a; color: white"
     light_green = "background-color: #9ae6b4; color: #1c4532"
     neutral_green = "background-color: #e6fffa; color: #22543d"
@@ -476,34 +480,39 @@ if diff_column_name:
     light_red = "background-color: #feb2b2; color: #742a2a"
     neutral_red = "background-color: #fff5f5; color: #742a2a"
 
-    p_series = display_df[p_value_column_name] if p_value_column_name else pd.Series(np.nan, index=display_df.index)
-
-    def diff_highlight(col: pd.Series) -> List[str]:
-        styles: List[str] = []
-        for idx, diff_val in col.items():
-            p_val = p_series.loc[idx]
-            if pd.isna(diff_val):
-                styles.append("")
-                continue
-            if diff_val > 0:
-                if pd.notna(p_val) and p_val < 0.01:
-                    styles.append(strong_green)
-                elif pd.notna(p_val) and p_val < 0.05:
-                    styles.append(light_green)
+    def make_value_highlighter(p_series: Optional[pd.Series]):
+        def _highlight(col: pd.Series) -> List[str]:
+            styles: List[str] = []
+            for idx, comp_val in col.items():
+                base_val = baseline_series.loc[idx]
+                if pd.isna(comp_val) or pd.isna(base_val):
+                    styles.append("")
+                    continue
+                diff_val = comp_val - base_val
+                if diff_val == 0 or pd.isna(diff_val):
+                    styles.append("")
+                    continue
+                p_val = p_series.loc[idx] if p_series is not None else np.nan
+                if diff_val > 0:
+                    if pd.notna(p_val) and p_val < 0.01:
+                        styles.append(strong_green)
+                    elif pd.notna(p_val) and p_val < 0.05:
+                        styles.append(light_green)
+                    else:
+                        styles.append(neutral_green)
                 else:
-                    styles.append(neutral_green)
-            elif diff_val < 0:
-                if pd.notna(p_val) and p_val < 0.01:
-                    styles.append(strong_red)
-                elif pd.notna(p_val) and p_val < 0.05:
-                    styles.append(light_red)
-                else:
-                    styles.append(neutral_red)
-            else:
-                styles.append("")
-        return styles
+                    if pd.notna(p_val) and p_val < 0.01:
+                        styles.append(strong_red)
+                    elif pd.notna(p_val) and p_val < 0.05:
+                        styles.append(light_red)
+                    else:
+                        styles.append(neutral_red)
+            return styles
+        return _highlight
 
-    styler = styler.apply(diff_highlight, subset=[diff_column_name])
+    for run in highlight_runs:
+        run_p_series = display_df[p_value_column_name] if (diff_column_name and p_value_column_name and run == comp_run) else None
+        styler = styler.apply(make_value_highlighter(run_p_series), subset=[run])
 
 # White background for None/NaN in all columns — apply last so it overrides prior styling
 def white_na(s: pd.Series):
