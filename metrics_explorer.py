@@ -5,6 +5,7 @@
 # - None/NaN show as empty text and get a white background.
 # - Comparison run values: only color when statistically significant (p < 0.05), with stronger shading for lower p-values.
 
+import io
 import re
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -14,6 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from math import erf, sqrt
+import boto3
 
 st.set_page_config(page_title="Metrics Explorer", layout="wide")
 st.title("📊 Metrics Explorer")
@@ -126,43 +128,107 @@ IDENTIFIER_HINTS = {"project", "project_id", "proj", "workspace", "team",
 st.sidebar.header("1) Load CSV")
 
 parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument("--csv", type=str, default="metrics_table.csv", help="Path to CSV to load by default")
+parser.add_argument("--csv", type=str, default=None, help="Path to CSV to load by default")
 cli_args, _ = parser.parse_known_args()
 
 uploaded = st.sidebar.file_uploader("Upload a CSV (optional)", type=["csv"])
 
-@st.cache_data(show_spinner=False)
-def load_df_from_path(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # Drop unnamed/index-like columns
+
+def _drop_unnamed_columns(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = [c for c in df.columns if re.match(r"^Unnamed(:.*)?$", str(c))]
     if drop_cols:
         df = df.drop(columns=drop_cols)
     return df
+
+@st.cache_data(show_spinner=False)
+def load_df_from_path(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    return _drop_unnamed_columns(df)
 
 @st.cache_data(show_spinner=False)
 def load_df_from_uploaded(file) -> pd.DataFrame:
     df = pd.read_csv(file)
-    drop_cols = [c for c in df.columns if re.match(r"^Unnamed(:.*)?$", str(c))]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    return df
+    return _drop_unnamed_columns(df)
+
+@st.cache_data(show_spinner=False)
+def load_df_from_s3(
+    bucket: str,
+    key: str,
+    region: Optional[str] = None,
+    aws_access_key_id: Optional[str] = None,
+    aws_secret_access_key: Optional[str] = None,
+    aws_session_token: Optional[str] = None,
+    endpoint_url: Optional[str] = None,
+) -> pd.DataFrame:
+    client = boto3.client(
+        "s3",
+        region_name=region,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        endpoint_url=endpoint_url,
+    )
+    response = client.get_object(Bucket=bucket, Key=key)
+    body = response["Body"].read()
+    df = pd.read_csv(io.BytesIO(body))
+    return _drop_unnamed_columns(df)
+
+
+def get_s3_default_config() -> Optional[Dict[str, str]]:
+    secrets_obj = getattr(st, "secrets", None)
+    if secrets_obj is None:
+        return None
+    section = None
+    try:
+        section = secrets_obj["s3_default_csv"]
+    except Exception:
+        section = secrets_obj.get("s3_default_csv") if hasattr(secrets_obj, "get") else None
+    if not section:
+        return None
+    if not isinstance(section, dict):
+        try:
+            section = dict(section)
+        except Exception:
+            section = None
+    if not section:
+        return None
+    bucket = section.get("bucket")
+    key = section.get("key")
+    if not bucket or not key:
+        return None
+    return section
 
 df = None
 data_source = ""
+s3_config = get_s3_default_config()
 
 if uploaded is not None:
     df = load_df_from_uploaded(uploaded)
     data_source = "uploaded file"
 else:
     script_dir = Path(__file__).resolve().parent
-    if cli_args.csv is not None:
+    if cli_args.csv:
         csv_path = Path(cli_args.csv).expanduser().resolve()
         if not csv_path.exists():
             st.error(f"--csv path not found: {csv_path}")
             st.stop()
         df = load_df_from_path(csv_path)
         data_source = f"--csv ({csv_path})"
+    elif s3_config is not None:
+        try:
+            df = load_df_from_s3(
+                bucket=s3_config.get("bucket"),
+                key=s3_config.get("key"),
+                region=s3_config.get("region"),
+                aws_access_key_id=s3_config.get("aws_access_key_id"),
+                aws_secret_access_key=s3_config.get("aws_secret_access_key"),
+                aws_session_token=s3_config.get("aws_session_token"),
+                endpoint_url=s3_config.get("endpoint_url"),
+            )
+            data_source = "default csv"
+        except Exception as exc:
+            st.error(f"Failed to load default CSV from S3: {exc}")
+            st.stop()
     else:
         default_csv = script_dir / "data.csv"  # change name if desired
         if default_csv.exists():
@@ -175,7 +241,8 @@ if df is None or df.empty:
         "Options:\n"
         "• Upload a CSV in the sidebar\n"
         "• Run with a path:  `streamlit run metrics_explorer.py -- --csv /path/to/file.csv`\n"
-        "• Put a `data.csv` next to the script"
+        "• Put a `data.csv` next to the script\n"
+        "• Configure `.streamlit/secrets.toml` with an `[s3_default_csv]` section"
     )
     st.stop()
 
