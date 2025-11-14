@@ -3,7 +3,7 @@
 # HARD-CODED metric-name → short-label mapping, and baseline vs. comparison diff highlighting.
 # - Fixes Streamlit deprecation: use width='stretch' instead of use_container_width.
 # - None/NaN show as empty text and get a white background.
-# - Comparison run values: green when > baseline, red otherwise (p-value-weighted).
+# - Comparison run values: only color when statistically significant (p < 0.05), with stronger shading for lower p-values.
 
 import re
 from typing import Dict, List, Optional
@@ -478,7 +478,7 @@ with right:
 # ───────────────────────────────────────────────────────────────────────────────
 # Styling:
 # - Format all numeric cells to 5 decimals.
-# - Highlight comparison value columns green/red with stronger shades for p-value <0.05 / <0.01 (when available).
+# - Highlight comparison value columns only when p-value <0.05 (stronger shade for p-value <0.01).
 # - Show None/NaN as empty text and force white background on those cells.
 # - Auto-size column min-width so content fits; prevent wrapping.
 # ───────────────────────────────────────────────────────────────────────────────
@@ -497,10 +497,8 @@ highlight_runs = [run for run in comparison_runs_sorted if run in display_df.col
 if baseline_for_calcs is not None and highlight_runs:
     strong_green = "background-color: #2f855a; color: white"
     light_green = "background-color: #9ae6b4; color: #1c4532"
-    neutral_green = "background-color: #e6fffa; color: #22543d"
     strong_red = "background-color: #c53030; color: white"
     light_red = "background-color: #feb2b2; color: #742a2a"
-    neutral_red = "background-color: #fff5f5; color: #742a2a"
 
     def make_value_highlighter(diff_series: pd.Series, p_series: Optional[pd.Series]):
         def _highlight(col: pd.Series) -> List[str]:
@@ -514,20 +512,19 @@ if baseline_for_calcs is not None and highlight_runs:
                     styles.append("")
                     continue
                 p_val = p_series.loc[idx] if (p_series is not None and idx in p_series.index) else np.nan
+                if pd.isna(p_val) or p_val >= 0.05:
+                    styles.append("")
+                    continue
                 if diff_val > 0:
                     if pd.notna(p_val) and p_val < 0.01:
                         styles.append(strong_green)
-                    elif pd.notna(p_val) and p_val < 0.05:
-                        styles.append(light_green)
                     else:
-                        styles.append(neutral_green)
+                        styles.append(light_green)
                 else:
                     if pd.notna(p_val) and p_val < 0.01:
                         styles.append(strong_red)
-                    elif pd.notna(p_val) and p_val < 0.05:
-                        styles.append(light_red)
                     else:
-                        styles.append(neutral_red)
+                        styles.append(light_red)
             return styles
         return _highlight
 
@@ -568,10 +565,16 @@ for col_label, ch in width_map.items():
         }
     )
 
-# Render styled table (Streamlit’s newer API: width='stretch')
+# Render styled table (Streamlit’s newer API: width='stretch') and lift the height cap so the full table shows
+# without Streamlit adding blank placeholder rows.
+row_height_px = 34
+header_height_px = 40
+extra_padding_px = 6
+table_height = int(header_height_px + extra_padding_px + max(1, len(display_df)) * row_height_px)
 st.dataframe(
     styler,
     width='stretch',
+    height=table_height,
     hide_index=True,
 )
 
